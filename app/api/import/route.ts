@@ -18,7 +18,7 @@ export async function POST(request: Request): Promise<Response> {
     }
     const content = Buffer.from(await file.arrayBuffer());
 
-    const summary: ImportSummary = await runImport(content);
+    const summary: ImportSummary = await runImport(content, file.name || null);
     return Response.json(summary);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

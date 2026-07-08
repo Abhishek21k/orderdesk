@@ -6,11 +6,21 @@ import {
   toUsdCents,
   GBP_ASSUMED,
 } from "./money";
-import type { ImportSummary } from "./types";
+import type { ImportSummary, RejectedRow } from "./types";
 
 // Column order in orders.csv:
 // order_id, customer_name, customer_email, order_date, updated_at, status, currency, amount
 const EXPECTED_COLUMNS = 8;
+const CSV_COLUMNS = [
+  "order_id",
+  "customer_name",
+  "customer_email",
+  "order_date",
+  "updated_at",
+  "status",
+  "currency",
+  "amount",
+] as const;
 const INSERT_BATCH = 500;
 
 type RejectReason =
@@ -33,6 +43,19 @@ interface ValidRow {
   amount_cents: number;
   amount_usd_cents: number;
   fileIndex: number; // position among data rows, for tie-breaking
+}
+
+// Zips a raw CSV row against the expected column labels for display. Handles
+// short/long/malformed rows without throwing.
+function toRawRow(row: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  CSV_COLUMNS.forEach((label, i) => {
+    out[label] = row[i] ?? "";
+  });
+  if (row.length !== EXPECTED_COLUMNS) {
+    out["_raw"] = row.join(",");
+  }
+  return out;
 }
 
 /**
@@ -91,7 +114,12 @@ function validateRow(row: string[], fileIndex: number): ValidRow | RejectReason 
   };
 }
 
-export async function runImport(content: Buffer): Promise<ImportSummary> {
+export async function runImport(
+  content: Buffer,
+  sourceFilename: string | null = null
+): Promise<ImportSummary> {
+  const startedAt = new Date();
+
   // Array mode so we can count fields per row. bom strips the UTF-8 BOM,
   // relax_column_count keeps short/long rows instead of throwing.
   const records: string[][] = parse(content, {
@@ -105,6 +133,7 @@ export async function runImport(content: Buffer): Promise<ImportSummary> {
   const rowsRead = dataRows.length;
 
   const rejectedByReason: Record<string, number> = {};
+  const rejectedRows: RejectedRow[] = [];
   const validRows: ValidRow[] = [];
 
   dataRows.forEach((row, i) => {
@@ -112,14 +141,16 @@ export async function runImport(content: Buffer): Promise<ImportSummary> {
       const result = validateRow(row, i);
       if (typeof result === "string") {
         rejectedByReason[result] = (rejectedByReason[result] ?? 0) + 1;
+        rejectedRows.push({ rowIndex: i, reason: result, rawRow: toRawRow(row) });
       } else {
         validRows.push(result);
       }
     } catch {
       // A single bad row must never crash the import. Bucket unexpected
       // failures with the amount reason as a defensive catch-all.
-      rejectedByReason["empty_or_bad_amount"] =
-        (rejectedByReason["empty_or_bad_amount"] ?? 0) + 1;
+      const reason: RejectReason = "empty_or_bad_amount";
+      rejectedByReason[reason] = (rejectedByReason[reason] ?? 0) + 1;
+      rejectedRows.push({ rowIndex: i, reason, rawRow: toRawRow(row) });
     }
   });
 
@@ -139,53 +170,8 @@ export async function runImport(content: Buffer): Promise<ImportSummary> {
   const duplicatesDropped = validRows.length - winnerRows.length;
   const imported = winnerRows.length;
 
-  // Persist: wipe both tables and bulk-insert winners inside one transaction.
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query("TRUNCATE orders");
-    await client.query("TRUNCATE change_log RESTART IDENTITY");
-
-    for (let start = 0; start < winnerRows.length; start += INSERT_BATCH) {
-      const batch = winnerRows.slice(start, start + INSERT_BATCH);
-      const values: unknown[] = [];
-      const tuples: string[] = [];
-      batch.forEach((r, idx) => {
-        const b = idx * 10;
-        tuples.push(
-          `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10})`
-        );
-        values.push(
-          r.order_id,
-          r.customer_name,
-          r.customer_email,
-          r.email_norm,
-          r.order_date,
-          r.updated_at,
-          r.status,
-          r.currency,
-          r.amount_cents,
-          r.amount_usd_cents
-        );
-      });
-      await client.query(
-        `INSERT INTO orders
-          (order_id, customer_name, customer_email, email_norm, order_date,
-           updated_at, status, currency, amount_cents, amount_usd_cents)
-         VALUES ${tuples.join(",")}`,
-        values
-      );
-    }
-
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
-
   const reconciles = rowsRead === imported + duplicatesDropped + rejected;
+  const finishedAt = new Date();
 
   const notes: string[] = [];
   if (GBP_ASSUMED) {
@@ -199,12 +185,104 @@ export async function runImport(content: Buffer): Promise<ImportSummary> {
     );
   }
 
+  // Persist: record the run (audit trail — never wiped), the rejected rows
+  // for that run, then wipe orders/change_log and bulk-insert the winners
+  // tagged with this run's id, all inside one transaction.
+  const client = await pool.connect();
+  let runId: number;
+  try {
+    await client.query("BEGIN");
+
+    const runResult = await client.query<{ id: number }>(
+      `INSERT INTO import_runs
+        (started_at, finished_at, source_filename, rows_read, imported,
+         duplicates_dropped, rejected, rejected_by_reason, reconciles)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING id`,
+      [
+        startedAt.toISOString(),
+        finishedAt.toISOString(),
+        sourceFilename,
+        rowsRead,
+        imported,
+        duplicatesDropped,
+        rejected,
+        JSON.stringify(rejectedByReason),
+        reconciles,
+      ]
+    );
+    runId = Number(runResult.rows[0].id);
+
+    for (let start = 0; start < rejectedRows.length; start += INSERT_BATCH) {
+      const batch = rejectedRows.slice(start, start + INSERT_BATCH);
+      const values: unknown[] = [];
+      const tuples: string[] = [];
+      batch.forEach((r, idx) => {
+        const b = idx * 4;
+        tuples.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4})`);
+        values.push(runId, r.rowIndex, r.reason, JSON.stringify(r.rawRow));
+      });
+      await client.query(
+        `INSERT INTO rejected_rows (import_run_id, row_index, reason, raw_row)
+         VALUES ${tuples.join(",")}`,
+        values
+      );
+    }
+
+    await client.query("TRUNCATE orders");
+    await client.query("TRUNCATE change_log RESTART IDENTITY");
+
+    for (let start = 0; start < winnerRows.length; start += INSERT_BATCH) {
+      const batch = winnerRows.slice(start, start + INSERT_BATCH);
+      const values: unknown[] = [];
+      const tuples: string[] = [];
+      batch.forEach((r, idx) => {
+        const b = idx * 11;
+        tuples.push(
+          `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11})`
+        );
+        values.push(
+          r.order_id,
+          r.customer_name,
+          r.customer_email,
+          r.email_norm,
+          r.order_date,
+          r.updated_at,
+          r.status,
+          r.currency,
+          r.amount_cents,
+          r.amount_usd_cents,
+          runId
+        );
+      });
+      await client.query(
+        `INSERT INTO orders
+          (order_id, customer_name, customer_email, email_norm, order_date,
+           updated_at, status, currency, amount_cents, amount_usd_cents, import_run_id)
+         VALUES ${tuples.join(",")}`,
+        values
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+
   return {
+    runId,
+    startedAt: startedAt.toISOString(),
+    finishedAt: finishedAt.toISOString(),
+    sourceFilename,
     rowsRead,
     imported,
     duplicatesDropped,
     rejected,
     rejectedByReason,
+    rejectedRows,
     reconciles,
     notes,
   };

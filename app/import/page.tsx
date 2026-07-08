@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import type { ImportSummary } from "@/lib/types";
+import { Fragment, useCallback, useEffect, useState } from "react";
+import type { ImportRunSummary, ImportSummary, RejectedRow } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -9,14 +9,187 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableHead,
+  TableHeader,
   TableRow,
 } from "@/components/ui/table";
+
+function formatTime(iso: string): string {
+  return new Date(iso).toLocaleString("en-US", {
+    dateStyle: "medium",
+    timeStyle: "medium",
+  });
+}
+
+function RejectedRowsTable({ rows }: { rows: RejectedRow[] }) {
+  if (rows.length === 0) {
+    return <p className="text-sm text-muted-foreground">None.</p>;
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Row #</TableHead>
+          <TableHead>Reason</TableHead>
+          <TableHead>Order ID</TableHead>
+          <TableHead>Customer</TableHead>
+          <TableHead>Email</TableHead>
+          <TableHead>Date</TableHead>
+          <TableHead>Amount</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map((r) => (
+          <TableRow key={r.rowIndex}>
+            <TableCell className="text-muted-foreground">{r.rowIndex + 1}</TableCell>
+            <TableCell>
+              <Badge variant="destructive">{r.reason}</Badge>
+            </TableCell>
+            <TableCell className="font-mono text-xs">
+              {r.rawRow.order_id || "—"}
+            </TableCell>
+            <TableCell>{r.rawRow.customer_name || "—"}</TableCell>
+            <TableCell>{r.rawRow.customer_email || "—"}</TableCell>
+            <TableCell>{r.rawRow.order_date || "—"}</TableCell>
+            <TableCell>{r.rawRow.amount || "—"}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+function ImportHistory({ refreshKey }: { refreshKey: number }) {
+  const [runs, setRuns] = useState<ImportRunSummary[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const [expandedRows, setExpandedRows] = useState<RejectedRow[]>([]);
+  const [expandedLoading, setExpandedLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetch("/api/import/runs", { cache: "no-store" })
+      .then((res) => res.json())
+      .then((body) => {
+        if (!cancelled) setRuns(body.runs ?? []);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshKey]);
+
+  const toggleExpand = useCallback(
+    async (runId: number) => {
+      if (expanded === runId) {
+        setExpanded(null);
+        return;
+      }
+      setExpanded(runId);
+      setExpandedLoading(true);
+      try {
+        const res = await fetch(`/api/import/runs/${runId}/rejected`, {
+          cache: "no-store",
+        });
+        const body = await res.json();
+        setExpandedRows(body.rejectedRows ?? []);
+      } finally {
+        setExpandedLoading(false);
+      }
+    },
+    [expanded]
+  );
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base font-semibold text-foreground">
+          Import History
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {loading && runs.length === 0 ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : runs.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No imports yet.</p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>When</TableHead>
+                <TableHead>File</TableHead>
+                <TableHead className="text-right">Read</TableHead>
+                <TableHead className="text-right">Imported</TableHead>
+                <TableHead className="text-right">Dupes</TableHead>
+                <TableHead className="text-right">Rejected</TableHead>
+                <TableHead>Reconciles</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {runs.map((run) => (
+                <Fragment key={run.id}>
+                  <TableRow
+                    className="cursor-pointer"
+                    onClick={() => run.rejected > 0 && toggleExpand(run.id)}
+                  >
+                    <TableCell>{formatTime(run.startedAt)}</TableCell>
+                    <TableCell className="text-muted-foreground">
+                      {run.sourceFilename ?? "—"}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {run.rowsRead}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {run.imported}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {run.duplicatesDropped}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {run.rejected > 0 ? (
+                        <span className="underline decoration-dotted">
+                          {run.rejected}
+                        </span>
+                      ) : (
+                        run.rejected
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={run.reconciles ? "success" : "destructive"}>
+                        {run.reconciles ? "yes" : "no"}
+                      </Badge>
+                    </TableCell>
+                  </TableRow>
+                  {expanded === run.id && (
+                    <TableRow>
+                      <TableCell colSpan={7} className="bg-muted/30">
+                        {expandedLoading ? (
+                          <p className="text-sm text-muted-foreground">Loading…</p>
+                        ) : (
+                          <RejectedRowsTable rows={expandedRows} />
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </Fragment>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 
 export default function ImportPage() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [summary, setSummary] = useState<ImportSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [historyKey, setHistoryKey] = useState(0);
 
   async function runImport() {
     if (!file) {
@@ -35,6 +208,7 @@ export default function ImportPage() {
         setError(body?.message ?? `Import failed (HTTP ${res.status})`);
       } else {
         setSummary(body as ImportSummary);
+        setHistoryKey((k) => k + 1);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -44,7 +218,7 @@ export default function ImportPage() {
   }
 
   return (
-    <div className="mx-auto max-w-2xl space-y-6">
+    <div className="mx-auto max-w-4xl space-y-6">
       <div>
         <h1 className="text-2xl font-semibold">Order Import</h1>
         <p className="text-sm text-muted-foreground">
@@ -72,6 +246,12 @@ export default function ImportPage() {
 
       {summary && (
         <div className="space-y-6">
+          <p className="text-sm text-muted-foreground">
+            Run #{summary.runId} · started {formatTime(summary.startedAt)} · finished{" "}
+            {formatTime(summary.finishedAt)}
+            {summary.sourceFilename ? ` · ${summary.sourceFilename}` : ""}
+          </p>
+
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Stat label="Rows read" value={summary.rowsRead} />
             <Stat label="Imported" value={summary.imported} />
@@ -113,6 +293,17 @@ export default function ImportPage() {
           <Card>
             <CardHeader>
               <CardTitle className="text-base font-semibold text-foreground">
+                Rejected rows
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <RejectedRowsTable rows={summary.rejectedRows} />
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base font-semibold text-foreground">
                 Notes
               </CardTitle>
             </CardHeader>
@@ -130,6 +321,8 @@ export default function ImportPage() {
           </Card>
         </div>
       )}
+
+      <ImportHistory refreshKey={historyKey} />
     </div>
   );
 }

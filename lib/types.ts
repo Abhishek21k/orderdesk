@@ -20,14 +20,38 @@ export interface OrdersResponse {
   pageSize: number;
 }
 
+export interface RejectedRow {
+  rowIndex: number;
+  reason: string;
+  rawRow: Record<string, string>;
+}
+
 export interface ImportSummary {
+  runId: number;
+  startedAt: string;
+  finishedAt: string;
+  sourceFilename: string | null;
   rowsRead: number;
   imported: number;
   duplicatesDropped: number;
   rejected: number;
   rejectedByReason: Record<string, number>;
+  rejectedRows: RejectedRow[];
   reconciles: boolean;
   notes: string[];
+}
+
+// Row shape for GET /api/import/runs (history/audit log).
+export interface ImportRunSummary {
+  id: number;
+  startedAt: string;
+  finishedAt: string;
+  sourceFilename: string | null;
+  rowsRead: number;
+  imported: number;
+  duplicatesDropped: number;
+  rejected: number;
+  reconciles: boolean;
 }
 
 export interface DashboardData {
