@@ -1,0 +1,6 @@
+allowBuilds:
+  sharp: set this to true or false
+  unrs-resolver: set this to true or false
+minimumReleaseAgeExclude:
+  - '@electric-sql/client@1.5.24'
+  - '@electric-sql/react@1.0.53'

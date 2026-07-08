@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orderdesk
+      POSTGRES_PASSWORD: orderdesk
+      POSTGRES_DB: orderdesk
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+    ports:
+      - "54329:5432"
+    volumes:
+      - orderdesk_pgdata:/var/lib/postgresql/data
+      # Runs once on a fresh volume to create the schema.
+      - ./lib/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderdesk"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  electric:
+    image: electricsql/electric:latest
+    environment:
+      DATABASE_URL: postgresql://orderdesk:orderdesk@postgres:5432/orderdesk?sslmode=disable
+      ELECTRIC_INSECURE: "true"
+    ports:
+      - "30001:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      args:
+        # Browser reaches Electric via the published host port.
+        NEXT_PUBLIC_ELECTRIC_URL: http://localhost:30001
+    environment:
+      # Server-side: reach Postgres over the compose network.
+      DATABASE_URL: postgresql://orderdesk:orderdesk@postgres:5432/orderdesk
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      electric:
+        condition: service_started
+
+volumes:
+  orderdesk_pgdata:
